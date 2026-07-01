@@ -55,7 +55,30 @@ const ALLOWED_HOSTS = [
 //       required: ["tickers"],
 //     },
 //   }
-const DISPATCH_TOOL: Record<string, unknown> | null = null;
+const DISPATCH_TOOL: Record<string, unknown> | null = {
+  type: "custom",
+  name: "dispatch_analysts",
+  description:
+    "Dispatch the desk's filing analysts to produce fresh, validated scorecards for the given tickers. " +
+    "Use this when you need current analysis for companies the desk has no up-to-date notes on in memory. " +
+    "Each analyst reads the company's latest SEC filings, returns a structured scorecard, and writes a " +
+    "research note to the desk's shared memory. Do not call it for companies whose notes already answer the question.",
+  input_schema: {
+    type: "object",
+    properties: {
+      tickers: {
+        type: "array",
+        items: { type: "string" },
+        description: "Stock tickers to analyze, e.g. [\"NVDA\", \"AMD\"]. One analyst session is dispatched per ticker.",
+      },
+      focus: {
+        type: "string",
+        description: "Optional angle for the analysts to emphasize, e.g. \"margin durability\" or \"inventory build\".",
+      },
+    },
+    required: ["tickers"],
+  },
+};
 
 const AGENT_TOOLSET = {
   type: "agent_toolset_20260401",
@@ -101,11 +124,6 @@ async function uploadSkill(displayTitle: string): Promise<{ skillId: string; ver
 export interface ProvisionStep {
   step: string;
   id: string;
-}
-
-// Used by the workshop stubs below: fails at runtime, satisfies the type checker.
-function todoStub(message: string): { id: string } {
-  throw new Error(message);
 }
 
 /**
@@ -168,63 +186,76 @@ export async function provisionDesk(agentPrefix = "research-desk"): Promise<{ co
     throw new Error("create your agent first (Setup → Say hello) — staffing the desk upgrades that same agent");
   }
 
-  const skill = await uploadSkill("edgartools — SEC EDGAR data access");
-  cfg.skill_id = skill.skillId;
-  cfg.skill_version = skill.version;
-  steps.push({ step: "skill", id: skill.skillId });
+  if (!cfg.skill_id) {
+    const skill = await uploadSkill("edgartools — SEC EDGAR data access");
+    cfg.skill_id = skill.skillId;
+    cfg.skill_version = skill.version;
+    saveConfig(cfg);
+  }
+  steps.push({ step: "skill", id: cfg.skill_id });
 
   const skillsRef = [{ type: "custom", skill_id: cfg.skill_id, version: "latest" }];
 
-  const financials = await client.beta.agents.create({
-    name: `${agentPrefix}-financials-extractor`,
-    model: MODEL,
-    system: loadPrompt("financials_specialist_system.md", { edgar_identity: cfg.edgar_identity }),
-    tools: [AGENT_TOOLSET],
-    skills: skillsRef,
-  } as never);
-  cfg.financials_agent_id = financials.id;
-  steps.push({ step: "financials specialist", id: financials.id });
+  if (!cfg.financials_agent_id) {
+    const financials = await client.beta.agents.create({
+      name: `${agentPrefix}-financials-extractor`,
+      model: MODEL,
+      system: loadPrompt("financials_specialist_system.md", { edgar_identity: cfg.edgar_identity }),
+      tools: [AGENT_TOOLSET],
+      skills: skillsRef,
+    } as never);
+    cfg.financials_agent_id = financials.id;
+    saveConfig(cfg);
+  }
+  steps.push({ step: "financials specialist", id: cfg.financials_agent_id });
 
-  const risk = await client.beta.agents.create({
-    name: `${agentPrefix}-risk-analyst`,
-    model: MODEL,
-    system: loadPrompt("risk_specialist_system.md", { edgar_identity: cfg.edgar_identity }),
-    tools: [AGENT_TOOLSET],
-    skills: skillsRef,
-  } as never);
-  cfg.risk_agent_id = risk.id;
-  steps.push({ step: "risk specialist", id: risk.id });
+  if (!cfg.risk_agent_id) {
+    const risk = await client.beta.agents.create({
+      name: `${agentPrefix}-risk-analyst`,
+      model: MODEL,
+      system: loadPrompt("risk_specialist_system.md", { edgar_identity: cfg.edgar_identity }),
+      tools: [AGENT_TOOLSET],
+      skills: skillsRef,
+    } as never);
+    cfg.risk_agent_id = risk.id;
+    saveConfig(cfg);
+  }
+  steps.push({ step: "risk specialist", id: cfg.risk_agent_id });
 
-  // TODO(workshop-3): create the filing analyst as a multiagent coordinator.
-  //
-  // A "sub-agent" is just another agent listed on its coordinator's roster.
-  // Replace the stub with `await client.beta.agents.create({ ... } as never)`,
-  // passing exactly:
-  //   name: `${agentPrefix}-filing-analyst`,
-  //   model: MODEL,
-  //   system: loadPrompt("analyst_system.md", { edgar_identity: cfg.edgar_identity }),
-  //   tools: [AGENT_TOOLSET],
-  //   skills: skillsRef,                     // the edgartools manual uploaded above
-  //   multiagent: {
-  //     type: "coordinator",
-  //     agents: [
-  //       { type: "agent", id: financials.id },
-  //       { type: "agent", id: risk.id },
-  //       { type: "self" },
-  //     ],
-  //   },
-  const analyst = todoStub("TODO(workshop-3): create the filing-analyst coordinator agent in src/lib/provision.ts");
-  cfg.analyst_agent_id = analyst.id;
-  steps.push({ step: "filing analyst (coordinator)", id: analyst.id });
+  if (!cfg.analyst_agent_id) {
+    // The filing analyst is a multiagent coordinator: a "sub-agent" is just
+    // another agent listed on its roster.
+    const analyst = await client.beta.agents.create({
+      name: `${agentPrefix}-filing-analyst`,
+      model: MODEL,
+      system: loadPrompt("analyst_system.md", { edgar_identity: cfg.edgar_identity }),
+      tools: [AGENT_TOOLSET],
+      skills: skillsRef,
+      multiagent: {
+        type: "coordinator",
+        agents: [
+          { type: "agent", id: cfg.financials_agent_id },
+          { type: "agent", id: cfg.risk_agent_id },
+          { type: "self" },
+        ],
+      },
+    } as never);
+    cfg.analyst_agent_id = analyst.id;
+    saveConfig(cfg);
+  }
+  steps.push({ step: "filing analyst (coordinator)", id: cfg.analyst_agent_id });
 
-  const memoryStore = await client.beta.memoryStores.create({
-    name: "desk-memory",
-    description:
-      "The research desk's accumulated knowledge: one note per company per filing under /companies/<TICKER>/, " +
-      "plus desk-level memos under /memos/. Read before re-analyzing a company; notes persist across sessions.",
-  } as never);
-  cfg.memory_store_id = memoryStore.id;
-  steps.push({ step: "memory store", id: memoryStore.id });
+  if (!cfg.memory_store_id) {
+    const memoryStore = await client.beta.memoryStores.create({
+      name: "desk-memory",
+      description:
+        "The research desk's accumulated knowledge: one note per company per filing under /companies/<TICKER>/, " +
+        "plus desk-level memos under /memos/. Read before re-analyzing a company; notes persist across sessions.",
+    } as never);
+    cfg.memory_store_id = memoryStore.id;
+    saveConfig(cfg);
+  }
+  steps.push({ step: "memory store", id: cfg.memory_store_id });
 
   // The SAME agent you said hello to gets promoted: agents are versioned, and
   // updates require the current version (optimistic concurrency).
